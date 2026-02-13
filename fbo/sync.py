@@ -11,19 +11,19 @@ from .ozon_api import OzonApi
 
 
 ACTIVE_STATES = [
-    "ORDER_STATE_READY_TO_SUPPLY",
-    "ORDER_STATE_ACCEPTED_AT_SUPPLY_WAREHOUSE",
-    "ORDER_STATE_IN_TRANSIT",
-    "ORDER_STATE_ACCEPTANCE_AT_STORAGE_WAREHOUSE",
-    "ORDER_STATE_REPORTS_CONFIRMATION_AWAITING",
-    "ORDER_STATE_COMPLETED",
-    "ORDER_STATE_OVERDUE",
+    "READY_TO_SUPPLY",
+    "ACCEPTED_AT_SUPPLY_WAREHOUSE",
+    "IN_TRANSIT",
+    "ACCEPTANCE_AT_STORAGE_WAREHOUSE",
+    "REPORTS_CONFIRMATION_AWAITING",
+    "COMPLETED",
+    "OVERDUE",
 ]
 
 CANCELLED_STATES = {
-    "ORDER_STATE_CANCELLED",
-    "ORDER_STATE_REJECTED_AT_SUPPLY_WAREHOUSE",
-    "ORDER_STATE_REPORT_REJECTED",
+    "CANCELLED",
+    "REJECTED_AT_SUPPLY_WAREHOUSE",
+    "REPORT_REJECTED",
 }
 
 
@@ -160,55 +160,107 @@ def sync_once(
 ) -> Tuple[int, int]:
     """Returns (created_count, skipped_count)."""
 
+    # We list order_ids, then fetch details for each and filter by timeslot.from.
+    # Window start = max(today-lookback_days, cfg.min_date_iso) (inclusive), based on TIMESLOT_FROM_UTC.
     today = date.today()
-    start = max(date.fromisoformat(cfg.min_date_iso), today - timedelta(days=cfg.lookback_days))
-    created_from = start.isoformat() + "T00:00:00Z"
+    start_date = max(date.fromisoformat(cfg.min_date_iso), today - timedelta(days=cfg.lookback_days))
+    start_dt = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
 
-    log(logger, logging.INFO, "ozon.list_supply_orders", op="ozon.list", err=None)
+    log(
+        logger,
+        logging.INFO,
+        "ozon.list_supply_orders",
+        op="ozon.list",
+        start_date=start_date.isoformat(),
+        sort_by="TIMESLOT_FROM_UTC",
+        sort_dir="DESC",
+        err=None,
+    )
 
     last_id: Optional[str] = None
-    to_process: List[Dict[str, Any]] = []
+    order_ids: List[int] = []
 
     while True:
-        resp = ozon.list_supply_orders(states=ACTIVE_STATES + list(CANCELLED_STATES), limit=100, last_id=last_id, created_from=created_from)
-        items = resp.get("items") or resp.get("orders") or []
-        to_process.extend(items)
+        resp = ozon.list_supply_orders(
+            states=ACTIVE_STATES + sorted(list(CANCELLED_STATES)),
+            limit=100,
+            last_id=last_id,
+            sort_by="TIMESLOT_FROM_UTC",
+            sort_dir="DESC",
+        )
+        ids = resp.get("order_ids") or []
+        order_ids.extend([int(x) for x in ids])
         last_id = resp.get("last_id")
-        has_next = bool(resp.get("has_next"))
-        if not has_next:
-            break
-        if not last_id:
+        if not last_id or not ids:
             break
 
     created = 0
     skipped = 0
 
-    for it in to_process:
-        order_id = str(it.get("order_id") or it.get("id") or "")
-        order_number = str(it.get("order_number") or it.get("orderNumber") or "")
-        state = str(it.get("state") or it.get("order_state") or "")
+    for oid in order_ids:
+        order_id = str(oid)
 
-        if not order_id or not order_number:
-            log(logger, logging.WARNING, "skip.item_missing_ids", op="skip", order_id=order_id, order_number=order_number)
+        # Always fetch details: we need state + order_number + timeslot to apply business date rules.
+        log(logger, logging.INFO, "ozon.details", op="ozon.details", order_id=order_id)
+        det = ozon.details(int(order_id))
+
+        order_number = str(det.get("order_number") or det.get("orderNumber") or "")
+        state = str(det.get("state") or det.get("order_state") or "")
+
+        if not order_number:
+            log(logger, logging.WARNING, "skip.missing_order_number", op="skip", order_id=order_id)
             skipped += 1
             continue
 
         if state in CANCELLED_STATES:
-            # we ignore cancelled; also forget if existed
-            if order_id in supplies_mem:
-                supplies_mem.pop(order_id, None)
-            log(logger, logging.INFO, "skip.cancelled", op="skip", order_id=order_id, order_number=order_number, entity="ozon")
+            # ignore cancelled; forget if existed
+            supplies_mem.pop(order_id, None)
+            log(logger, logging.INFO, "skip.cancelled", op="skip", order_id=order_id, order_number=order_number, state=state)
             skipped += 1
             continue
 
-        # memory short-circuit: if seen and state unchanged and state == READY_TO_SUPPLY, skip but keep
+        # timeslot filter (business rule)
+        timeslot_from = None
+        try:
+            timeslot_from = (((det.get("timeslot") or {}).get("value") or {}).get("timeslot") or {}).get("from")
+        except Exception:
+            timeslot_from = None
+
+        if not timeslot_from:
+            log(logger, logging.INFO, "skip.no_timeslot", op="skip", order_id=order_id, order_number=order_number, state=state)
+            skipped += 1
+            continue
+
+        try:
+            ts_dt = datetime.fromisoformat(timeslot_from.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            log(logger, logging.WARNING, "skip.bad_timeslot", op="skip", order_id=order_id, order_number=order_number, timeslot_from=timeslot_from)
+            skipped += 1
+            continue
+
+        if ts_dt < start_dt:
+            log(
+                logger,
+                logging.INFO,
+                "skip.timeslot_before_window",
+                op="skip",
+                order_id=order_id,
+                order_number=order_number,
+                state=state,
+                timeslot_from=timeslot_from,
+                window_from=start_dt.isoformat(),
+            )
+            skipped += 1
+            continue
+
+        # memory short-circuit: if seen and state unchanged and READY_TO_SUPPLY, skip but keep
         mem = supplies_mem.get(order_id)
-        if mem and mem.get("state") == state and state == "ORDER_STATE_READY_TO_SUPPLY":
-            log(logger, logging.INFO, "skip.same_state_ready", op="skip", order_id=order_id, order_number=order_number, entity="ozon")
+        if mem and mem.get("state") == state and state == "READY_TO_SUPPLY":
+            log(logger, logging.INFO, "skip.same_state_ready", op="skip", order_id=order_id, order_number=order_number, state=state)
             skipped += 1
             continue
 
-        # if not in memory, or state changed, we must ensure MS order exists; if exists -> skip & forget
+        # Ensure MS order exists; if exists -> skip & forget (user rule)
         existing = ms.find_customerorder_by_name(order_number)
         if existing:
             log(logger, logging.INFO, "ms.customerorder_exists_skip_forget", op="ms.exists", order_id=order_id, order_number=order_number, ms_id=existing.get("id"))
@@ -216,15 +268,8 @@ def sync_once(
             skipped += 1
             continue
 
-        # Need full details to build comment and bundle_id/timeslot
-        log(logger, logging.INFO, "ozon.details", op="ozon.details", order_id=order_id, order_number=order_number)
-        det = ozon.details(int(order_id))
-
-        delivery_planned = None
-        try:
-            delivery_planned = (((det.get("timeslot") or {}).get("value") or {}).get("timeslot") or {}).get("from")
-        except Exception:
-            delivery_planned = None
+        # use timeslot.from for deliveryPlannedMoment
+        delivery_planned = timeslot_from
 
         # destination warehouse descriptor
         supplies = det.get("supplies") or []

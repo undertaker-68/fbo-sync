@@ -24,7 +24,8 @@ class OzonApi:
         states: List[str],
         limit: int = 100,
         last_id: Optional[str] = None,
-        created_from: Optional[str] = None,
+        sort_by: str = "TIMESLOT_FROM_UTC",
+        sort_dir: str = "DESC",
     ) -> Dict[str, Any]:
         """Raw /v3/supply-order/list.
 
@@ -35,12 +36,11 @@ class OzonApi:
                 "states": states,
             },
             "limit": limit,
+            "sort_by": sort_by,
+            "sort_dir": sort_dir,
         }
         if last_id:
             body["last_id"] = last_id
-        if created_from:
-            # best-effort; if field unsupported Ozon will 400 and we'll see it in logs
-            body["filter"]["created_from"] = created_from
         return self.c.request("POST", "/v3/supply-order/list", json_body=body)
 
     def details(self, order_id: int) -> Dict[str, Any]:
