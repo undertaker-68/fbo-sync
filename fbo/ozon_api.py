@@ -46,6 +46,13 @@ class OzonApi:
     def details(self, order_id: int) -> Dict[str, Any]:
         return self.c.request("POST", "/v1/supply-order/details", json_body={"order_id": order_id})
 
+    def get_supply_orders(self, order_ids: List[int]) -> Dict[str, Any]:
+        """POST /v3/supply-order/get
+
+        Returns {"orders": [...]} with drop_off_warehouse and supplies.storage_warehouse including name/address.
+        """
+        return self.c.request("POST", "/v3/supply-order/get", json_body={"order_ids": order_ids})
+
     def bundle_items(self, bundle_id: str, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
         # bundle_ids is required array; limit is required 1..100
         body = {"bundle_ids": [bundle_id], "limit": limit, "offset": offset}

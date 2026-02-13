@@ -23,6 +23,15 @@ class MsApi:
     def create_customerorder(self, body: Dict[str, Any]) -> Dict[str, Any]:
         return self.c.request("POST", "/entity/customerorder", json_body=body)
 
+    # ===== Move =====
+    def find_move_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        resp = self.c.request("GET", "/entity/move", params={"filter": f"name={name}", "limit": 1, "offset": 0})
+        rows = resp.get("rows") or []
+        return rows[0] if rows else None
+
+    def create_move(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        return self.c.request("POST", "/entity/move", json_body=body)
+
     def search_product_by_article(self, article: str) -> Optional[Dict[str, Any]]:
         resp = self.c.request("GET", "/entity/product", params={"filter": f"article={article}", "limit": 1, "offset": 0})
         rows = resp.get("rows") or []
