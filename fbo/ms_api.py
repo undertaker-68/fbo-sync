@@ -31,6 +31,26 @@ class MsApi:
 
     def create_move(self, body: Dict[str, Any]) -> Dict[str, Any]:
         return self.c.request("POST", "/entity/move", json_body=body)
+    
+    def search_product_by_article(self, article: str):
+        # returns first row or None
+        r = self.c.request(
+            "GET",
+            "/entity/product",
+            params={"filter": f"article={article}", "limit": 1, "offset": 0},
+        )
+        rows = r.get("rows") or []
+        return rows[0] if rows else None
+
+    def search_bundle_by_article(self, article: str):
+        # returns first row or None
+        r = self.c.request(
+            "GET",
+            "/entity/bundle",
+            params={"filter": f"article={article}", "limit": 1, "offset": 0},
+        )
+        rows = r.get("rows") or []
+        return rows[0] if rows else None
 
 # ===== Demand =====
 def find_demand_by_name(self, name: str) -> Optional[Dict[str, Any]]:
