@@ -24,7 +24,15 @@ ACTIVE_STATES = [
 CANCELLED_STATES = {
     "CANCELLED",
     "REJECTED_AT_SUPPLY_WAREHOUSE",
+}
+
+DEMAND_STATES = {
+    "ACCEPTED_AT_SUPPLY_WAREHOUSE",
+    "IN_TRANSIT",
+    "ACCEPTANCE_AT_STORAGE_WAREHOUSE",
+    "REPORTS_CONFIRMATION_AWAITING",
     "REPORT_REJECTED",
+    "COMPLETED",
 }
 
 
@@ -407,30 +415,87 @@ def sync_once(
                 skipped += 1
                 continue
 
-            # If Move already exists -> forget supply
+            # If Move already exists -> keep, we may still need Demand later
             mv_existing = ms.find_move_by_name(order_number)
             if mv_existing:
-                log(logger, logging.INFO, "ms.move_exists_forget", op="ms.exists", order_id=order_id, order_number=order_number, ms_move_id=mv_existing.get("id"))
-                supplies_mem.pop(order_id, None)
-                skipped += 1
-                continue
+                log(logger, logging.INFO, "ms.move_exists", op="ms.exists", order_id=order_id, order_number=order_number, ms_move_id=mv_existing.get("id"))
+                mv = mv_existing
+            else:
+                mv = None
 
-            move_body = {
+            if mv is None:
+                move_body = {
+                    "name": order_number,
+                    "description": comment,
+                    "organization": meta(f"{ms.c.base_url}/entity/organization/{cfg.ms_org_id}", "organization"),
+                    "agent": meta(f"{ms.c.base_url}/entity/counterparty/{cfg.ms_agent_id}", "counterparty"),
+                    "sourceStore": meta(f"{ms.c.base_url}/entity/store/{cfg.ms_move_source_store_id}", "store"),
+                    "targetStore": meta(f"{ms.c.base_url}/entity/store/{cfg.ms_move_target_store_id}", "store"),
+                    "state": meta(f"{ms.c.base_url}/entity/move/metadata/states/{cfg.ms_move_state_id}", "state"),
+                    "customerOrder": meta(f"{ms.c.base_url}/entity/customerorder/{co.get('id')}", "customerorder"),
+                    "positions": positions,
+                    "applicable": True,
+                }
+
+                if cfg.dry_run:
+                    log(logger, logging.INFO, "DRY_RUN.ms.create_move", op="dry", order_id=order_id, order_number=order_number)
+    # Create Demand linked to CustomerOrder when state is active but NOT READY_TO_SUPPLY
+demand: Optional[Dict[str, Any]] = None
+demand_done = False
+
+if state in DEMAND_STATES:
+    co_href = f"{ms.c.base_url}/entity/customerorder/{co.get('id')}"
+    # 1) check by link
+    d_link = ms.find_demand_by_customerorder_href(co_href)
+    if d_link:
+        demand = d_link
+        demand_done = True
+        log(logger, logging.INFO, "ms.demand_exists_by_link_done", op="ms.exists", order_id=order_id, order_number=order_number, ms_demand_id=d_link.get("id"))
+    else:
+        # 2) check by name (avoid conflicts)
+        d_name = ms.find_demand_by_name(order_number)
+        if d_name:
+            demand = d_name
+            demand_done = True
+            log(logger, logging.INFO, "ms.demand_exists_by_name_done", op="ms.exists", order_id=order_id, order_number=order_number, ms_demand_id=d_name.get("id"))
+        else:
+            demand_body = {
                 "name": order_number,
                 "description": comment,
                 "organization": meta(f"{ms.c.base_url}/entity/organization/{cfg.ms_org_id}", "organization"),
                 "agent": meta(f"{ms.c.base_url}/entity/counterparty/{cfg.ms_agent_id}", "counterparty"),
-                "sourceStore": meta(f"{ms.c.base_url}/entity/store/{cfg.ms_move_source_store_id}", "store"),
-                "targetStore": meta(f"{ms.c.base_url}/entity/store/{cfg.ms_move_target_store_id}", "store"),
-                "state": meta(f"{ms.c.base_url}/entity/move/metadata/states/{cfg.ms_move_state_id}", "state"),
-                "customerOrder": meta(f"{ms.c.base_url}/entity/customerorder/{co.get('id')}", "customerorder"),
+                "store": meta(f"{ms.c.base_url}/entity/store/{cfg.ms_demand_store_id}", "store"),
+                "state": meta(f"{ms.c.base_url}/entity/demand/metadata/states/{cfg.ms_demand_state_id}", "state"),
+                "customerOrder": meta(co_href, "customerorder"),
                 "positions": positions,
                 "applicable": True,
             }
 
             if cfg.dry_run:
-                log(logger, logging.INFO, "DRY_RUN.ms.create_move", op="dry", order_id=order_id, order_number=order_number)
-                supplies_mem[order_id] = {
+                log(logger, logging.INFO, "DRY_RUN.ms.create_demand", op="dry", order_id=order_id, order_number=order_number)
+                demand = {"id": "DRY", "meta": {"href": "DRY"}, "applicable": True}
+                demand_done = True
+            else:
+                try:
+                    log(logger, logging.INFO, "ms.create_demand", op="ms.create", order_id=order_id, order_number=order_number, applicable=True)
+                    demand = ms.create_demand(demand_body)
+                    demand_done = True
+                except HttpError as e:
+                    if _is_name_conflict(e):
+                        log(logger, logging.ERROR, "ms.create_demand_name_conflict_done", op="error", order_id=order_id, order_number=order_number, err=str(e))
+                        demand_done = True
+                    elif _is_stock_error(e):
+                        demand_body["applicable"] = False
+                        log(logger, logging.WARNING, "ms.create_demand_retry_not_applicable", op="ms.retry", order_id=order_id, order_number=order_number)
+                        demand = ms.create_demand(demand_body)
+                        demand_done = True
+                    else:
+                        raise
+elif state == "READY_TO_SUPPLY":
+    # keep in memory, wait for transition to a demand state
+    demand_done = False
+
+            supplies_mem[order_id] = {
                     "order_number": order_number,
                     "state": state,
                     "ms": {"dry": True},
@@ -459,7 +524,9 @@ def sync_once(
                 "order_number": order_number,
                 "state": state,
                 "ms": {"id": co.get("id"), "href": (co.get("meta") or {}).get("href")},
-                "move": {"id": mv.get("id"), "href": (mv.get("meta") or {}).get("href"), "applicable": mv.get("applicable")},
+                "move": ({"id": mv.get("id"), "href": (mv.get("meta") or {}).get("href"), "applicable": mv.get("applicable")} if mv else None),
+                "demand": ({"id": demand.get("id"), "href": (demand.get("meta") or {}).get("href"), "applicable": demand.get("applicable")} if demand else None),
+                "done": bool(demand_done),
             }
 
     return created, skipped

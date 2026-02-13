@@ -72,6 +72,10 @@ class FboConfig:
     ms_move_source_store_id: str
     ms_move_target_store_id: str
 
+    # Demand (MS) for each CustomerOrder
+    ms_demand_state_id: str
+    ms_demand_store_id: str
+
     # interval
     min_date_iso: str  # inclusive, e.g. 2026-02-02
     lookback_days: int
@@ -119,6 +123,9 @@ def load_config(repo_root: Path) -> tuple[OzonConfig, MsConfig, FboConfig]:
         ms_move_state_id=env_str("MS_FBO_MOVE_STATE_ID"),
         ms_move_source_store_id=env_str("MS_FBO_MOVE_SOURCE_STORE_ID"),
         ms_move_target_store_id=env_str("MS_FBO_MOVE_TARGET_STORE_ID"),
+
+        ms_demand_state_id=env_str("MS_FBO_DEMAND_STATE_ID"),
+        ms_demand_store_id=env_str("MS_FBO_DEMAND_STORE_ID"),
 
         min_date_iso=os.getenv("FBO_MIN_DATE", "2026-02-02"),
         lookback_days=env_int("FBO_LOOKBACK_DAYS", 20),
