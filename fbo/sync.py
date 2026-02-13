@@ -397,33 +397,35 @@ def sync_once(
                     "salesChannel": meta(f"{ms.c.base_url}/entity/saleschannel/{cfg.ms_sales_channel_id}", "saleschannel"),
                     "state": meta(f"{ms.c.base_url}/entity/customerorder/metadata/states/{cfg.ms_state_id}", "state"),
                     "positions": positions,
+                    "applicable": True,
                 }
                 if delivery_planned:
-                    body["deliveryPlannedMoment"] = iso_to_ms_moment(delivery_planned)
-
+                    body["deliveryPlannedMoment"] = delivery_planned
+            
                 if cfg.dry_run:
                     log(logger, logging.INFO, "DRY_RUN.ms.create_customerorder", op="dry", order_id=order_id, order_number=order_number)
-                    # still proceed to dry-run move creation
                     co = {"id": "DRY", "meta": {"href": "DRY"}}
                 else:
                     log(logger, logging.INFO, "ms.create_customerorder", op="ms.create", order_id=order_id, order_number=order_number)
                     co = ms.create_customerorder(body)
                     created += 1
-
-            # Create Move linked to CustomerOrder
+            
             if co is None:
                 skipped += 1
                 continue
-
-            # If Move already exists -> keep, we may still need Demand later
-            mv_existing = ms.find_move_by_name(order_number)
-            if mv_existing:
-                log(logger, logging.INFO, "ms.move_exists", op="ms.exists", order_id=order_id, order_number=order_number, ms_move_id=mv_existing.get("id"))
-                mv = mv_existing
+            
+            # If this supply already finalized (Demand exists/created earlier) - skip forever
+            mem2 = supplies_mem.get(order_id)
+            if mem2 and mem2.get("done"):
+                log(logger, logging.INFO, "skip.done", op="skip", order_id=order_id, order_number=order_number, state=state)
+                skipped += 1
+                continue
+            
+            # Create/ensure Move linked to CustomerOrder (always)
+            mv = ms.find_move_by_name(order_number)
+            if mv:
+                log(logger, logging.INFO, "ms.move_exists", op="ms.exists", order_id=order_id, order_number=order_number, ms_move_id=mv.get("id"))
             else:
-                mv = None
-
-            if mv is None:
                 move_body = {
                     "name": order_number,
                     "description": comment,
@@ -436,97 +438,95 @@ def sync_once(
                     "positions": positions,
                     "applicable": True,
                 }
-
+            
                 if cfg.dry_run:
                     log(logger, logging.INFO, "DRY_RUN.ms.create_move", op="dry", order_id=order_id, order_number=order_number)
-    # Create Demand linked to CustomerOrder when state is active but NOT READY_TO_SUPPLY
-demand: Optional[Dict[str, Any]] = None
-demand_done = False
-
-if state in DEMAND_STATES:
-    co_href = f"{ms.c.base_url}/entity/customerorder/{co.get('id')}"
-    # 1) check by link
-    d_link = ms.find_demand_by_customerorder_href(co_href)
-    if d_link:
-        demand = d_link
-        demand_done = True
-        log(logger, logging.INFO, "ms.demand_exists_by_link_done", op="ms.exists", order_id=order_id, order_number=order_number, ms_demand_id=d_link.get("id"))
-    else:
-        # 2) check by name (avoid conflicts)
-        d_name = ms.find_demand_by_name(order_number)
-        if d_name:
-            demand = d_name
-            demand_done = True
-            log(logger, logging.INFO, "ms.demand_exists_by_name_done", op="ms.exists", order_id=order_id, order_number=order_number, ms_demand_id=d_name.get("id"))
-        else:
-            demand_body = {
-                "name": order_number,
-                "description": comment,
-                "organization": meta(f"{ms.c.base_url}/entity/organization/{cfg.ms_org_id}", "organization"),
-                "agent": meta(f"{ms.c.base_url}/entity/counterparty/{cfg.ms_agent_id}", "counterparty"),
-                "store": meta(f"{ms.c.base_url}/entity/store/{cfg.ms_demand_store_id}", "store"),
-                "state": meta(f"{ms.c.base_url}/entity/demand/metadata/states/{cfg.ms_demand_state_id}", "state"),
-                "customerOrder": meta(co_href, "customerorder"),
-                "positions": positions,
-                "applicable": True,
-            }
-
-            if cfg.dry_run:
-                log(logger, logging.INFO, "DRY_RUN.ms.create_demand", op="dry", order_id=order_id, order_number=order_number)
-                demand = {"id": "DRY", "meta": {"href": "DRY"}, "applicable": True}
-                demand_done = True
-            else:
-                try:
-                    log(logger, logging.INFO, "ms.create_demand", op="ms.create", order_id=order_id, order_number=order_number, applicable=True)
-                    demand = ms.create_demand(demand_body)
-                    demand_done = True
-                except HttpError as e:
-                    if _is_name_conflict(e):
-                        log(logger, logging.ERROR, "ms.create_demand_name_conflict_done", op="error", order_id=order_id, order_number=order_number, err=str(e))
-                        demand_done = True
-                    elif _is_stock_error(e):
-                        demand_body["applicable"] = False
-                        log(logger, logging.WARNING, "ms.create_demand_retry_not_applicable", op="ms.retry", order_id=order_id, order_number=order_number)
-                        demand = ms.create_demand(demand_body)
-                        demand_done = True
-                    else:
-                        raise
-elif state == "READY_TO_SUPPLY":
-    # keep in memory, wait for transition to a demand state
-    demand_done = False
-
-            supplies_mem[order_id] = {
-                    "order_number": order_number,
-                    "state": state,
-                    "ms": {"dry": True},
-                    "move": {"dry": True},
-                }
-                skipped += 1
-                continue
-
-            try:
-                log(logger, logging.INFO, "ms.create_move", op="ms.create", order_id=order_id, order_number=order_number, applicable=True)
-                mv = ms.create_move(move_body)
-            except HttpError as e:
-                if _is_name_conflict(e):
-                    log(logger, logging.ERROR, "ms.create_move_name_conflict_forget", op="error", order_id=order_id, order_number=order_number, err=str(e))
-                    supplies_mem.pop(order_id, None)
-                    skipped += 1
-                    continue
-                if _is_stock_error(e):
-                    move_body["applicable"] = False
-                    log(logger, logging.WARNING, "ms.create_move_retry_not_applicable", op="ms.retry", order_id=order_id, order_number=order_number)
-                    mv = ms.create_move(move_body)
+                    mv = {"id": "DRY", "meta": {"href": "DRY"}, "applicable": True}
                 else:
-                    raise
-
+                    try:
+                        log(logger, logging.INFO, "ms.create_move", op="ms.create", order_id=order_id, order_number=order_number, applicable=True)
+                        mv = ms.create_move(move_body)
+                    except HttpError as e:
+                        if _is_name_conflict(e):
+                            log(logger, logging.ERROR, "ms.create_move_name_conflict_forget", op="error", order_id=order_id, order_number=order_number, err=str(e))
+                            supplies_mem.pop(order_id, None)
+                            skipped += 1
+                            continue
+                        if _is_stock_error(e):
+                            move_body["applicable"] = False
+                            log(logger, logging.WARNING, "ms.create_move_retry_not_applicable", op="ms.retry", order_id=order_id, order_number=order_number)
+                            mv = ms.create_move(move_body)
+                        else:
+                            raise
+            
+            # Create/ensure Demand linked to CustomerOrder ONLY when state is in DEMAND_STATES (NOT READY)
+            demand: Optional[Dict[str, Any]] = None
+            demand_done = False
+            if state in DEMAND_STATES:
+                co_href = f"{ms.c.base_url}/entity/customerorder/{co.get('id')}"
+                # by link
+                d_link = ms.find_demand_by_customerorder_href(co_href)
+                if d_link:
+                    demand = d_link
+                    demand_done = True
+                    log(logger, logging.INFO, "ms.demand_exists_by_link_done", op="ms.exists", order_id=order_id, order_number=order_number, ms_demand_id=d_link.get("id"))
+                else:
+                    # by name
+                    d_name = ms.find_demand_by_name(order_number)
+                    if d_name:
+                        demand = d_name
+                        demand_done = True
+                        log(logger, logging.INFO, "ms.demand_exists_by_name_done", op="ms.exists", order_id=order_id, order_number=order_number, ms_demand_id=d_name.get("id"))
+                    else:
+                        demand_body = {
+                            "name": order_number,
+                            "description": comment,
+                            "organization": meta(f"{ms.c.base_url}/entity/organization/{cfg.ms_org_id}", "organization"),
+                            "agent": meta(f"{ms.c.base_url}/entity/counterparty/{cfg.ms_agent_id}", "counterparty"),
+                            "store": meta(f"{ms.c.base_url}/entity/store/{cfg.ms_demand_store_id}", "store"),
+                            "state": meta(f"{ms.c.base_url}/entity/demand/metadata/states/{cfg.ms_demand_state_id}", "state"),
+                            "customerOrder": meta(co_href, "customerorder"),
+                            "positions": positions,
+                            "applicable": True,
+                        }
+            
+                        if cfg.dry_run:
+                            log(logger, logging.INFO, "DRY_RUN.ms.create_demand", op="dry", order_id=order_id, order_number=order_number)
+                            demand = {"id": "DRY", "meta": {"href": "DRY"}, "applicable": True}
+                            demand_done = True
+                        else:
+                            try:
+                                log(logger, logging.INFO, "ms.create_demand", op="ms.create", order_id=order_id, order_number=order_number, applicable=True)
+                                demand = ms.create_demand(demand_body)
+                                demand_done = True
+                            except HttpError as e:
+                                if _is_name_conflict(e):
+                                    log(logger, logging.ERROR, "ms.create_demand_name_conflict_done", op="error", order_id=order_id, order_number=order_number, err=str(e))
+                                    demand_done = True
+                                elif _is_stock_error(e):
+                                    demand_body["applicable"] = False
+                                    log(logger, logging.WARNING, "ms.create_demand_retry_not_applicable", op="ms.retry", order_id=order_id, order_number=order_number)
+                                    demand = ms.create_demand(demand_body)
+                                    demand_done = True
+                                else:
+                                    raise
+            
+            # Update memory
             supplies_mem[order_id] = {
                 "order_number": order_number,
                 "state": state,
-                "ms": {"id": co.get("id"), "href": (co.get("meta") or {}).get("href")},
-                "move": ({"id": mv.get("id"), "href": (mv.get("meta") or {}).get("href"), "applicable": mv.get("applicable")} if mv else None),
-                "demand": ({"id": demand.get("id"), "href": (demand.get("meta") or {}).get("href"), "applicable": demand.get("applicable")} if demand else None),
+                "ms": {
+                    "customerorder": co.get("meta"),
+                    "move": (mv or {}).get("meta"),
+                    "demand": (demand or {}).get("meta"),
+                },
                 "done": bool(demand_done),
             }
+            
+            if demand_done:
+                log(logger, logging.INFO, "done.demand", op="done", order_id=order_id, order_number=order_number, state=state)
+                skipped += 1
+                continue
+
 
     return created, skipped
